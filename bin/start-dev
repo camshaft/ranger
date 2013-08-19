@@ -1,0 +1,12 @@
+#!/bin/sh
+
+erlang="./otp/bin/erl"
+! [ -f "$erlang" ] && erlang="erl"
+
+# Default to 8 threads
+if [ -z "$THREAD_COUNT" ]
+then
+   THREAD_COUNT="8"
+fi
+
+$erlang +K true +A$THREAD_COUNT -smp auto -name ranger@`hostname` -pa ebin -pa deps/*/ebin -env ERL_LIBS deps -s ranger -s sync
