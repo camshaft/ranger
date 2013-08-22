@@ -11,7 +11,7 @@
 start(_Type, _Args) ->
   Dispatch = cowboy_router:compile([
     {'_', [
-      {"/", ranger_proxy, []}
+      {"/", ranger_example, []}
     ]}
   ]),
 
