@@ -18,7 +18,11 @@
   conn :: any(),
   backend :: {atom(), list(), integer(), binary()},
   timeout :: integer(),
-  req_headers :: binary()
+  req_headers :: [{binary(), binary()}],
+  req_body :: binary(),
+
+  res_status :: integer(),
+  res_headers = [] :: [{iolist(), iolist()}]
 }).
 
 -define(DEFAULT_TIMEOUT, 5000).
@@ -108,16 +112,11 @@ open_connection(Req, State=#state{backend={_Proto, Host, Port, _Path}, timeout=T
       next(Req, State, 502)
   end.
 
-init_request(Req, State=#state{conn=Conn, method=Method}) ->
+init_request(Req, State=#state{method=Method}) ->
   {Path, Req2} = cowboy_req:path_info(Req),
   {Version, Req3} = cowboy_req:version(Req2),
   Message = format_request(Method, Path, Version),
-  case gen_tcp:send(Conn, Message) of
-    ok ->
-      next(Req3, State, fun forwarded_header_prefix/2);
-    {error, _Error} ->
-      next(Req3, State, 502)
-  end.
+  send(Req3, State, Message, fun forwarded_header_prefix/2).
 
 forwarded_header_prefix(Req, State=#state{backend=Backend, req_headers=ReqHeaders}) ->
   case call(Req, State, forwarded_header_prefix) of
@@ -151,7 +150,7 @@ req_headers(Req, State=#state{req_headers=ReqHeaders}) ->
       next(Req2, State2, fun send_req_headers/2)
   end.
 
-send_req_headers(Req, State=#state{conn=Conn, req_headers=ReqHeaders, backend=Backend}) ->
+send_req_headers(Req, State=#state{req_headers=ReqHeaders, backend=Backend}) ->
   FormattedHeaders = [case Name of
     <<"host">> ->
       format_header(Name, format_host_header(Backend));
@@ -159,15 +158,90 @@ send_req_headers(Req, State=#state{conn=Conn, req_headers=ReqHeaders, backend=Ba
       format_header(Name, Value)
   end || {Name, Value} <- ReqHeaders],
 
-  case gen_tcp:send(Conn, [FormattedHeaders, <<"\r\n">>]) of
-    ok ->
-      next(Req, State, fun req_body/2);
-    {error, _Error} ->
-      next(Req, State, 502)
-  end.
+  send(Req, State, [FormattedHeaders, <<"\r\n">>], fun req_body/2).
 
 req_body(Req, State) ->
-  respond(Req, State, 200).
+  case cowboy_req:has_body(Req) of
+    true ->
+      case exported(Req, State, req_body, 3) of
+        true ->
+          %% TODO should we catch the errors?
+          %% TODO expose max body size variable
+          {ok, Body, Req2} = cowboy_req:body(Req),
+          {Body2, Req3, State2} = call(Req2, State, req_body, Body),
+          next(Req3, State2#state{req_body = Body2}, fun send_req_body/2);
+        _ ->
+          next(Req, State, fun chunk_req_body/2)
+      end;
+    _ ->
+      next(Req, State, fun get_res_status/2)
+  end.
+
+send_req_body(Req, State = #state{req_body = Body}) ->
+  %% TODO can we send all of the body at once and have it buffer automatically or do we need to chunk it?
+  send(Req, State, Body, fun get_res_status/2).
+
+chunk_req_body(Req, State) ->
+  %% TODO expose max body size variable
+  case cowboy_req:stream_body(Req) of
+    {ok, Body, Req2} ->
+      send(Req2, State, Body, fun chunk_req_body/2);
+    {done, Req2} ->
+      next(Req2, State, fun get_res_status/2);
+    {error, _Reason} ->
+      %% TODO send back a better error message
+      next(Req, State, 400)
+  end.
+
+get_res_status(Req, State = #state{conn = Conn}) ->
+  inet:setopts(Conn, [{active, once}]),
+  receive
+    {http, Conn, {http_response, _HttpVersion, _HttpRespCode, ResStatus}} ->
+      next(Req, State#state{res_status = ResStatus}, fun get_res_headers/2);
+    {tcp_closed, Conn} ->
+      next(Req, State, 502)
+  %% TODO add a response timeout
+  % after Timeout
+  end.
+
+get_res_headers(Req, State = #state{conn = Conn, res_status = ResStatus, res_headers = ResHeaders}) ->
+  %% TODO how do we make it not forward the headers onto the client?
+  inet:setopts(Conn, [{active, once}]),
+  receive
+    {http, Conn, {http_header, _, 'Connection', _, _Val}} ->
+      get_res_headers(Req, State);
+    {http, Conn, {http_header, _, Field, _, Value}} ->
+      NewResHeaders = [{atom_to_binary(Field), Value}|ResHeaders],
+      get_res_headers(Req, State#state{res_headers = NewResHeaders});
+    {http, Conn, http_eoh} ->
+      {ManipulatedHeaders, Req2, State2} = case call(Req, State, res_headers, ResHeaders) of
+        no_call ->
+          {ResHeaders, Req, State};
+        Result ->
+          Result
+      end,
+      {ok, Req3} = cowboy_req:chunked_reply(ResStatus, ManipulatedHeaders, Req2),
+      next(Req3, State2, fun get_res_body/2)
+  %% TODO add a response timeout
+  % after Timeout
+  end.
+
+get_res_body(Req, State = #state{conn = Conn}) ->
+  inet:setopts(Conn, [{active, once}, {packet, raw}]),
+  receive
+    {tcp, Conn, Data} ->
+      ok = cowboy_req:chunk(Data, Req),
+      get_res_body(Req, State);
+    {tcp_closed, Conn} ->
+      terminate(Req, State);
+    Other ->
+      io:format("~p~n", [Other]),
+      get_res_body(Req, State)
+  %% TODO add a response timeout
+  % after Timeout
+  end.
+
+
 
 % internal
 
@@ -198,6 +272,9 @@ format_forwarded_headers({Proto, Host, Port, Path}, Prefix) ->
     {<<Prefix/binary, "-port">>, integer_to_binary(Port)},
     {<<Prefix/binary, "-path">>, Path}
   ].
+
+atom_to_binary(Val) ->
+  list_to_binary(atom_to_list(Val)).
 
 %% Protocol
 
@@ -237,10 +314,21 @@ call(Req, State=#state{handler=Handler, handler_state=HandlerState}, Callback, A
       no_call
   end.
 
+exported(_Req, _State = #state{handler=Handler}, Callback, Arity) ->
+  erlang:function_exported(Handler, Callback, Arity).
+
 next(Req, State, Next) when is_function(Next) ->
   Next(Req, State);
 next(Req, State, StatusCode) when is_integer(StatusCode) ->
   respond(Req, State, StatusCode).
+
+send(Req, State = #state{conn = Conn}, Data, OnOK) ->
+  case gen_tcp:send(Conn, Data) of
+    ok ->
+      OnOK(Req, State);
+    {error, _Error} ->
+      next(Req, State, 502)
+  end.
 
 respond(Req, State, StatusCode) ->
   {ok, Req2} = cowboy_req:reply(StatusCode, Req),
