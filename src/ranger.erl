@@ -22,7 +22,10 @@
   req_body :: binary(),
 
   res_status :: integer(),
-  res_headers = [] :: [{iolist(), iolist()}]
+  res_headers = [] :: [{iolist(), iolist()}],
+
+  content_length = 0,
+  sent_length = 0
 }).
 
 -define(DEFAULT_TIMEOUT, 5000).
@@ -113,10 +116,16 @@ open_connection(Req, State=#state{backend={_Proto, Host, Port, _Path}, timeout=T
   end.
 
 init_request(Req, State=#state{method=Method}) ->
-  {Path, Req2} = cowboy_req:path_info(Req),
-  {Version, Req3} = cowboy_req:version(Req2),
-  Message = format_request(Method, Path, Version),
-  send(Req3, State, Message, fun forwarded_header_prefix/2).
+  {Version, Req2} = cowboy_req:version(Req),
+  {Message, Req4} = case cowboy_req:path_info(Req2) of
+    {<<"/", _>> = P, Req3} ->
+      {format_request(Method, P, Version), Req3};
+    {undefined, Req3} ->
+      {format_request(Method, <<"/">>, Version), Req3};
+    {Path, Req3} ->
+      {format_request(Method, [<<"/">>, Path], Version), Req3}
+  end,
+  send(Req4, State, Message, fun forwarded_header_prefix/2).
 
 forwarded_header_prefix(Req, State=#state{backend=Backend, req_headers=ReqHeaders}) ->
   case call(Req, State, forwarded_header_prefix) of
@@ -129,15 +138,15 @@ forwarded_header_prefix(Req, State=#state{backend=Backend, req_headers=ReqHeader
       next(Req2, State2, fun request_id/2)
   end.
 
-request_id(Req, State=#state{req_headers=ReqHeaders}) ->
+request_id(Req, State=#state{req_headers=ReqHeaders, res_headers=ResHeaders}) ->
   case call(Req, State, request_id) of
     no_call ->
       next(Req, State, fun req_headers/2);
     {ID, Req2, HandlerState} ->
-      Req3 = cowboy_req:set_resp_header(<<"x-request-id">>, ID, Req2),
       State2 = State#state{handler_state=HandlerState,
-                           req_headers=[{<<"x-request-id">>, ID}|ReqHeaders]},
-      next(Req3, State2, fun req_headers/2)
+                           req_headers=[{<<"x-request-id">>, ID}|ReqHeaders],
+                           res_headers=[{<<"x-request-id">>, ID}|ResHeaders]},
+      next(Req2, State2, fun req_headers/2)
   end.
 
 req_headers(Req, State=#state{req_headers=ReqHeaders}) ->
@@ -210,6 +219,11 @@ get_res_headers(Req, State = #state{conn = Conn, res_status = ResStatus, res_hea
   receive
     {http, Conn, {http_header, _, 'Connection', _, _Val}} ->
       get_res_headers(Req, State);
+    {http, Conn, {http_header, _, 'Date', _, _Val}} ->
+      get_res_headers(Req, State);
+    {http, Conn, {http_header, _, 'Content-Length', _, Val}} ->
+      % NewResHeaders = [{<<"content-length">>, Val}|ResHeaders],
+      get_res_headers(Req, State#state{content_length = binary_to_integer(Val)});
     {http, Conn, {http_header, _, Field, _, Value}} ->
       NewResHeaders = [{atom_to_binary(Field), Value}|ResHeaders],
       get_res_headers(Req, State#state{res_headers = NewResHeaders});
@@ -226,22 +240,29 @@ get_res_headers(Req, State = #state{conn = Conn, res_status = ResStatus, res_hea
   % after Timeout
   end.
 
-get_res_body(Req, State = #state{conn = Conn}) ->
+get_res_body(Req, State = #state{conn = Conn, content_length = Length, sent_length = Sent}) ->
   inet:setopts(Conn, [{active, once}, {packet, raw}]),
   receive
     {tcp, Conn, Data} ->
       ok = cowboy_req:chunk(Data, Req),
-      get_res_body(Req, State);
+      ChunkLength = byte_size(Data),
+      NewSent = ChunkLength + Sent,
+      case NewSent >= Length of
+        true ->
+          terminate(Req, State);
+        _ ->
+          get_res_body(Req, State#state{sent_length = NewSent})
+      end;
     {tcp_closed, Conn} ->
       terminate(Req, State);
+    {cowboy_req, resp_sent} ->
+      get_res_body(Req, State);
     Other ->
-      io:format("~p~n", [Other]),
+      io:format("Unhandled message: ~p~n", [Other]),
       get_res_body(Req, State)
   %% TODO add a response timeout
   % after Timeout
   end.
-
-
 
 % internal
 
@@ -319,6 +340,9 @@ exported(_Req, _State = #state{handler=Handler}, Callback, Arity) ->
 
 next(Req, State, Next) when is_function(Next) ->
   Next(Req, State);
+next(Req, State, StatusCode) when is_integer(StatusCode) andalso StatusCode >= 500 ->
+  {ok, Req2} = cowboy_req:reply(StatusCode, Req),
+  error_terminate(Req2, State);
 next(Req, State, StatusCode) when is_integer(StatusCode) ->
   respond(Req, State, StatusCode).
 
@@ -334,8 +358,9 @@ respond(Req, State, StatusCode) ->
   {ok, Req2} = cowboy_req:reply(StatusCode, Req),
   terminate(Req2, State).
 
-terminate(Req, State=#state{env=Env}) ->
+terminate(Req, State=#state{env=Env, conn = Conn}) ->
   proxy_terminate(Req, State),
+  gen_tcp:close(Conn),
   {ok, Req, [{result, ok}|Env]}.
 
 -spec error_terminate(cowboy_req:req(), #state{}) -> no_return().
