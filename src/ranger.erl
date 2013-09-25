@@ -22,7 +22,10 @@
   req_body :: binary(),
 
   res_status :: integer(),
-  res_headers = [] :: [{iolist(), iolist()}]
+  res_headers = [] :: [{iolist(), iolist()}],
+  res_body_fun :: fun(),
+  res_sent_bytes = 0 :: integer(),
+  length = 0
 }).
 
 -define(DEFAULT_TIMEOUT, 5000).
@@ -141,7 +144,7 @@ request_id(Req, State=#state{req_headers=ReqHeaders}) ->
   end.
 
 req_headers(Req, State=#state{req_headers=ReqHeaders}) ->
-  case call(Req, State, req_headers, ReqHeaders) of
+  case call(Req, State, req_headers, lists:keydelete(<<"connection">>, 1, ReqHeaders)) of
     no_call ->
       next(Req, State, fun send_req_headers/2);
     {ReqHeaders2, Req2, HandlerState} ->
@@ -196,47 +199,63 @@ chunk_req_body(Req, State) ->
 get_res_status(Req, State = #state{conn = Conn}) ->
   inet:setopts(Conn, [{active, once}]),
   receive
-    {http, Conn, {http_response, _HttpVersion, _HttpRespCode, ResStatus}} ->
-      next(Req, State#state{res_status = ResStatus}, fun get_res_headers/2);
+    {http, Conn, {http_response, _HttpVersion, HttpRespCode, _ResStatus}} ->
+      next(Req, State#state{res_status = HttpRespCode}, fun get_res_headers/2);
     {tcp_closed, Conn} ->
       next(Req, State, 502)
   %% TODO add a response timeout
   % after Timeout
   end.
 
-get_res_headers(Req, State = #state{conn = Conn, res_status = ResStatus, res_headers = ResHeaders}) ->
+get_res_headers(Req, State = #state{conn = Conn, res_headers = ResHeaders}) ->
   %% TODO how do we make it not forward the headers onto the client?
   inet:setopts(Conn, [{active, once}]),
   receive
     {http, Conn, {http_header, _, 'Connection', _, _Val}} ->
       get_res_headers(Req, State);
+    {http, Conn, {http_header, _, 'Content-Length', _, Length}} ->
+      get_res_headers(Req, State#state{length = binary_to_integer(Length)});
+    {http, Conn, {http_header, _, 'Date', _, _Val}} ->
+      get_res_headers(Req, State);
     {http, Conn, {http_header, _, Field, _, Value}} ->
       NewResHeaders = [{atom_to_binary(Field), Value}|ResHeaders],
       get_res_headers(Req, State#state{res_headers = NewResHeaders});
     {http, Conn, http_eoh} ->
-      {ManipulatedHeaders, Req2, State2} = case call(Req, State, res_headers, ResHeaders) of
-        no_call ->
-          {ResHeaders, Req, State};
-        Result ->
-          Result
-      end,
-      {ok, Req3} = cowboy_req:chunked_reply(ResStatus, ManipulatedHeaders, Req2),
-      next(Req3, State2, fun get_res_body/2)
+      send_res_headers(Req, State)
   %% TODO add a response timeout
   % after Timeout
   end.
 
-get_res_body(Req, State = #state{conn = Conn}) ->
+send_res_headers(Req, State = #state{res_status = ResStatus, res_headers = ResHeaders}) ->
+  {ManipulatedHeaders, Req2, State2} = case call(Req, State, res_headers, ResHeaders) of
+    no_call ->
+      {ResHeaders, Req, State};
+    Result ->
+      Result
+  end,
+  {ok, Req3} = cowboy_req:chunked_reply(ResStatus, ManipulatedHeaders, Req2),
+  next(Req3, State2, fun get_res_body/2).
+
+get_res_body(Req, State) ->
+  case exported(Req, State, res_body, 3) of
+    true ->
+      ok;
+    _ ->
+      stream_body(Req, State)
+  end.
+
+%% TODO handle chunked encoding
+
+stream_body(Req, State = #state{res_sent_bytes = SentBytes, length = Length}) when SentBytes >= Length ->
+  terminate(Req, State);
+stream_body(Req, State = #state{conn = Conn, res_sent_bytes = SentBytes}) ->
   inet:setopts(Conn, [{active, once}, {packet, raw}]),
   receive
     {tcp, Conn, Data} ->
       ok = cowboy_req:chunk(Data, Req),
-      get_res_body(Req, State);
+      get_res_body(Req, State#state{res_sent_bytes = SentBytes + byte_size(Data)});
     {tcp_closed, Conn} ->
-      terminate(Req, State);
-    Other ->
-      io:format("~p~n", [Other]),
-      get_res_body(Req, State)
+      terminate(Req, State)
   %% TODO add a response timeout
   % after Timeout
   end.
@@ -273,8 +292,12 @@ format_forwarded_headers({Proto, Host, Port, Path}, Prefix) ->
     {<<Prefix/binary, "-path">>, Path}
   ].
 
-atom_to_binary(Val) ->
-  list_to_binary(atom_to_list(Val)).
+atom_to_binary(Val) when is_atom(Val) ->
+  list_to_binary(atom_to_list(Val));
+atom_to_binary(Val) when is_binary(Val) ->
+  Val;
+atom_to_binary(Val) when is_list(Val) ->
+  list_to_binary(Val).
 
 %% Protocol
 

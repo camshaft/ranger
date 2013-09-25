@@ -4,6 +4,7 @@
 -export([proxy_init/2]).
 -export([backend/2]).
 -export([timeout/3]).
+-export([request_id/2]).
 -export([req_headers/3]).
 
 -define(CONNECT_TIMEOUT, 5000).
@@ -19,6 +20,9 @@ backend(Req, State) ->
 
 timeout(_Host, Req, State) ->
   {?CONNECT_TIMEOUT, Req, State}.
+
+request_id(Req, State) ->
+  {<<"test">>, Req, State}.
 
 req_headers(Headers, Req, State) ->
   {[{<<"x-test">>, <<"123">>}|Headers], Req, State}.
