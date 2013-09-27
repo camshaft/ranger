@@ -24,8 +24,9 @@
   res_status :: integer(),
   res_headers = [] :: [{iolist(), iolist()}],
 
-  content_length = 0,
-  sent_length = 0
+  res_body_fun :: fun(),
+  res_sent_bytes = 0 :: integer(),
+  length = 0
 }).
 
 -define(DEFAULT_TIMEOUT, 5000).
@@ -96,11 +97,21 @@ backend(Req, State) ->
 timeout(Req, State=#state{backend=Backend}) ->
   case call(Req, State, timeout, Backend) of
     no_call ->
-      next(Req, State#state{timeout=?DEFAULT_TIMEOUT}, fun open_connection/2);
+      next(Req, State#state{timeout=?DEFAULT_TIMEOUT}, fun short_circuit/2);
     {Timeout, Req2, HandlerState} ->
       State2 = State#state{handler_state=HandlerState,
                            timeout=Timeout},
-      next(Req2, State2, fun open_connection/2)
+      next(Req2, State2, fun short_circuit/2)
+  end.
+
+short_circuit(Req, State) ->
+  case call(Req, State, short_circuit) of
+    no_call ->
+      next(Req, State, fun open_connection/2);
+    {false, Req, State} ->
+      next(Req, State, fun open_connection/2);
+    {true, Req, State} ->
+      {ok, Req, State}
   end.
 
 open_connection(Req, State=#state{backend={_Proto, Host, Port, _Path}, timeout=Timeout}) ->
@@ -150,7 +161,7 @@ request_id(Req, State=#state{req_headers=ReqHeaders, res_headers=ResHeaders}) ->
   end.
 
 req_headers(Req, State=#state{req_headers=ReqHeaders}) ->
-  case call(Req, State, req_headers, ReqHeaders) of
+  case call(Req, State, req_headers, lists:keydelete(<<"connection">>, 1, ReqHeaders)) of
     no_call ->
       next(Req, State, fun send_req_headers/2);
     {ReqHeaders2, Req2, HandlerState} ->
@@ -205,61 +216,63 @@ chunk_req_body(Req, State) ->
 get_res_status(Req, State = #state{conn = Conn}) ->
   inet:setopts(Conn, [{active, once}]),
   receive
-    {http, Conn, {http_response, _HttpVersion, _HttpRespCode, ResStatus}} ->
-      next(Req, State#state{res_status = ResStatus}, fun get_res_headers/2);
+    {http, Conn, {http_response, _HttpVersion, HttpRespCode, _ResStatus}} ->
+      next(Req, State#state{res_status = HttpRespCode}, fun get_res_headers/2);
     {tcp_closed, Conn} ->
       next(Req, State, 502)
   %% TODO add a response timeout
   % after Timeout
   end.
 
-get_res_headers(Req, State = #state{conn = Conn, res_status = ResStatus, res_headers = ResHeaders}) ->
+get_res_headers(Req, State = #state{conn = Conn, res_headers = ResHeaders}) ->
   %% TODO how do we make it not forward the headers onto the client?
   inet:setopts(Conn, [{active, once}]),
   receive
     {http, Conn, {http_header, _, 'Connection', _, _Val}} ->
       get_res_headers(Req, State);
+    {http, Conn, {http_header, _, 'Content-Length', _, Length}} ->
+      get_res_headers(Req, State#state{length = binary_to_integer(Length)});
     {http, Conn, {http_header, _, 'Date', _, _Val}} ->
       get_res_headers(Req, State);
-    {http, Conn, {http_header, _, 'Content-Length', _, Val}} ->
-      % NewResHeaders = [{<<"content-length">>, Val}|ResHeaders],
-      get_res_headers(Req, State#state{content_length = binary_to_integer(Val)});
     {http, Conn, {http_header, _, Field, _, Value}} ->
       NewResHeaders = [{atom_to_binary(Field), Value}|ResHeaders],
       get_res_headers(Req, State#state{res_headers = NewResHeaders});
     {http, Conn, http_eoh} ->
-      {ManipulatedHeaders, Req2, State2} = case call(Req, State, res_headers, ResHeaders) of
-        no_call ->
-          {ResHeaders, Req, State};
-        Result ->
-          Result
-      end,
-      {ok, Req3} = cowboy_req:chunked_reply(ResStatus, ManipulatedHeaders, Req2),
-      next(Req3, State2, fun get_res_body/2)
+      send_res_headers(Req, State)
   %% TODO add a response timeout
   % after Timeout
   end.
 
-get_res_body(Req, State = #state{conn = Conn, content_length = Length, sent_length = Sent}) ->
+send_res_headers(Req, State = #state{res_status = ResStatus, res_headers = ResHeaders}) ->
+  {ManipulatedHeaders, Req2, State2} = case call(Req, State, res_headers, ResHeaders) of
+    no_call ->
+      {ResHeaders, Req, State};
+    Result ->
+      Result
+  end,
+  {ok, Req3} = cowboy_req:chunked_reply(ResStatus, ManipulatedHeaders, Req2),
+  next(Req3, State2, fun get_res_body/2).
+
+get_res_body(Req, State) ->
+  case exported(Req, State, res_body, 3) of
+    true ->
+      ok;
+    _ ->
+      stream_body(Req, State)
+  end.
+
+%% TODO handle chunked encoding
+
+stream_body(Req, State = #state{res_sent_bytes = SentBytes, length = Length}) when SentBytes >= Length ->
+  terminate(Req, State);
+stream_body(Req, State = #state{conn = Conn, res_sent_bytes = SentBytes}) ->
   inet:setopts(Conn, [{active, once}, {packet, raw}]),
   receive
     {tcp, Conn, Data} ->
       ok = cowboy_req:chunk(Data, Req),
-      ChunkLength = byte_size(Data),
-      NewSent = ChunkLength + Sent,
-      case NewSent >= Length of
-        true ->
-          terminate(Req, State);
-        _ ->
-          get_res_body(Req, State#state{sent_length = NewSent})
-      end;
+      get_res_body(Req, State#state{res_sent_bytes = SentBytes + byte_size(Data)});
     {tcp_closed, Conn} ->
-      terminate(Req, State);
-    {cowboy_req, resp_sent} ->
-      get_res_body(Req, State);
-    Other ->
-      io:format("Unhandled message: ~p~n", [Other]),
-      get_res_body(Req, State)
+      terminate(Req, State)
   %% TODO add a response timeout
   % after Timeout
   end.
@@ -294,8 +307,12 @@ format_forwarded_headers({Proto, Host, Port, Path}, Prefix) ->
     {<<Prefix/binary, "-path">>, Path}
   ].
 
-atom_to_binary(Val) ->
-  list_to_binary(atom_to_list(Val)).
+atom_to_binary(Val) when is_atom(Val) ->
+  list_to_binary(atom_to_list(Val));
+atom_to_binary(Val) when is_binary(Val) ->
+  Val;
+atom_to_binary(Val) when is_list(Val) ->
+  list_to_binary(Val).
 
 %% Protocol
 
