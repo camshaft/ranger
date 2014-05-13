@@ -163,7 +163,7 @@ init_request(Req, State = #state{conn = Conn, method = Method, req_headers = Hea
   Ref = gun:request(Conn, Method, Path, Headers),
   next(Req, State#state{ref = Ref}, fun req_body/2).
 
-req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
+req_body(Req, State = #state{conn = Conn, ref = Ref, method = Method}) ->
   case cowboy_req:has_body(Req) of
     true ->
       case exported(Req, State, req_body, 3) of
@@ -172,8 +172,10 @@ req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
         _ ->
           next(Req, State, fun chunk_req_body/2)
       end;
-    _ ->
+    _ when Method =:= <<"POST">> orelse Method =:= <<"PUT">> orelse Method =:= <<"PATCH">> ->
       ok = gun:data(Conn, Ref, fin, []),
+      next(Req, State, fun res_status/2);
+    _ ->
       next(Req, State, fun res_status/2)
   end.
 
@@ -199,18 +201,20 @@ chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
     {done, Req2} ->
       ok = gun:data(Conn, Ref, fin, <<>>),
       next(Req2, State, fun res_status/2);
-    {error, _Reason} ->
-      %% TODO send back a better error message
-      next(Req, State, 400)
+    {error, Reason} ->
+      error_terminate(Req, State, error, Reason, chunk_req_body, 2, 400)
   end.
 
-res_status(Req, State = #state{conn = Conn, ref = Ref, timeout = _Timeout, res_headers = ResHeaders}) ->
-  receive
-    {gun_response, Conn, Ref, Fin, Status, Headers} ->
+res_status(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout, res_headers = ResHeaders}) ->
+  case gun:await(Conn, Ref, Timeout) of
+    {response, Fin, Status, Headers} ->
       next(Req, State#state{res_status = Status,
                             res_headers = filter_headers(Headers, ResHeaders),
-                            res_has_body = Fin =:= nofin}, fun res_headers/2)
-  %% after Timeout TODO
+                            res_has_body = Fin =:= nofin}, fun res_headers/2);
+    {error, timeout} ->
+      next(Req, State, 504);
+    {error, Reason} ->
+      error_terminate(Req, State, error, Reason, res_status, 2, 502)
   end.
 
 res_headers(Req, State = #state{res_headers = ResHeaders}) ->
@@ -232,21 +236,35 @@ reply(Req, State = #state{res_status = Status, res_headers = Headers}) ->
 res_body(Req, State) ->
   case exported(Req, State, res_body, 3) of
     true ->
-      %% TODO
-      ok;
+      next(Req, State, fun transform_res_body/2);
     _ ->
-      next(Req, State, fun stream_body/2)
+      next(Req, State, fun chunk_res_body/2)
   end.
 
-stream_body(Req, State = #state{conn = Conn, ref = Ref, timeout = _Timeout}) ->
-  receive
-    {gun_data, Conn, Ref, nofin, Data} ->
+transform_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) ->
+  case gun:await_body(Conn, Ref, Timeout) of
+    {ok, Body} ->
+      {Body2, Req2, HandlerState} = call(Req, State, res_body, Body),
+      ok = cowboy_req:chunk(Body2, Req2),
+      terminate(Req, State#state{handler_state = HandlerState});
+    {error, timeout} ->
+      next(Req, State, 504);
+    {error, Reason} ->
+      error_terminate(Req, State, error, Reason, res_status, 2, 502)
+  end.
+
+chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) ->
+  case gun:await(Conn, Ref, Timeout) of
+    {data, nofin, Data} ->
       ok = cowboy_req:chunk(Data, Req),
-      stream_body(Req, State);
-    {gun_data, Conn, Ref, fin, Data} ->
+      chunk_res_body(Req, State);
+    {data, fin, Data} ->
       ok = cowboy_req:chunk(Data, Req),
-      terminate(Req, State)
-  %% after Timeout TODO
+      terminate(Req, State);
+    {error, timeout} ->
+      next(Req, State, 504);
+    {error, Reason} ->
+      error_terminate(Req, State, error, Reason, res_status, 2, 502)
   end.
 
 %% Formatting
@@ -381,10 +399,12 @@ terminate(Req, State = #state{env = Env, conn = Conn}) ->
   ok = gun:close(Conn),
   {ok, Req, [{result, ok}|Env]}.
 
+error_terminate(Req, State, Class, Reason, Callback, Arity) ->
+  error_terminate(Req, State, Class, Reason, Callback, Arity, 500).
 error_terminate(Req, State = #state{handler = Handler, handler_state = HandlerState},
-		Class, Reason, Callback, Arity) ->
+		Class, Reason, Callback, Arity, Status) ->
   proxy_terminate(Req, State),
-  cowboy_req:maybe_reply(500, Req),
+  cowboy_req:maybe_reply(Status, Req),
   erlang:Class([
     {reason, Reason},
     {mfa, {Handler, Callback, Arity}},
