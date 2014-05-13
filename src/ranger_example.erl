@@ -26,7 +26,7 @@ forwarded_header_prefix(Req, State) ->
   {<<"x-orig">>, Req, State}.
 
 request_id(Req, State) ->
-  {<<"request-id">>, Req, State}.
+  {integer_to_binary(erlang:phash2(Req)), Req, State}.
 
 req_headers(Headers, Req, State) ->
   {[{<<"x-test">>, <<"123">>}|Headers], Req, State}.

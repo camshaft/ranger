@@ -77,7 +77,7 @@ timeout(Req, State = #state{backend = Backend}) ->
 
 open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeout = Timeout}) ->
   Opts = [
-    {retry, 1}, %% TODO configure?
+    {retry, fast_key:get(retry, State#state.env, 1)},
     {retry_timeout, Timeout},
     {type, type_from_proto(Proto)}
   ],
@@ -168,17 +168,27 @@ req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
     true ->
       case exported(Req, State, req_body, 3) of
         true ->
-          %% TODO should we catch the errors?
-          %% TODO expose max body size variable
-          {ok, Body, Req2} = cowboy_req:body(Req),
-          {Body2, Req3, State2} = call(Req2, State, req_body, Body),
-          ok = gun:data(Conn, Ref, fin, Body2),
-          next(Req3, State2, fun res_status/2);
+          next(Req, State, fun transform_req_body/2);
         _ ->
           next(Req, State, fun chunk_req_body/2)
       end;
     _ ->
+      ok = gun:data(Conn, Ref, fin, []),
       next(Req, State, fun res_status/2)
+  end.
+
+transform_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
+  MaxLength = fast_key:get(maxlength, State#state.env, 8000000),
+  case cowboy_req:body(MaxLength, Req) of
+    {ok, Body, Req2} ->
+      {Body2, Req3, HandlerState} = call(Req2, State, req_body, Body),
+      ok = gun:data(Conn, Ref, fin, Body2),
+      next(Req3, State#state{handler_state = HandlerState}, fun res_status/2);
+    {error, chunked} ->
+      %% TODO buffer the body
+      terminate(Req, State);
+    {error, badlength} ->
+      next(Req, State, 413)
   end.
 
 chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
