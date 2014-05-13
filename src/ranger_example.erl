@@ -4,6 +4,7 @@
 -export([proxy_init/2]).
 -export([backend/2]).
 -export([timeout/3]).
+-export([forwarded_header_prefix/2]).
 -export([request_id/2]).
 -export([req_headers/3]).
 
@@ -16,10 +17,13 @@ proxy_init(Req, Opts) ->
   {ok, Req, Opts}.
 
 backend(Req, State) ->
-  {{http, "localhost", 4040, <<"/">>}, Req, State}.
+  {{http, "oc-api-mock.herokuapp.com", 80, <<"/">>}, Req, State}.
 
 timeout(_Host, Req, State) ->
   {?CONNECT_TIMEOUT, Req, State}.
+
+forwarded_header_prefix(Req, State) ->
+  {<<"x-orig">>, Req, State}.
 
 request_id(Req, State) ->
   {<<"request-id">>, Req, State}.

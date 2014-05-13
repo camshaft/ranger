@@ -7,3 +7,4 @@ ebin
 *.dump
 *.log
 *.local
+.erlang.mk*
