@@ -12,7 +12,8 @@ main([]) ->
 
   Dispatch = cowboy_router:compile([
     {'_', [
-      {"/test/[...]", ranger_example, []},
+      {"/api/[...]", ranger_example, []},
+      {"/:app/[...]", ranger_example, []},
       {"/", ranger_example, []}
     ]}
   ]),

@@ -271,11 +271,24 @@ chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) -
 %% Formatting
 format_forwarded_headers(Req, {Proto, Host, Port, Path}) ->
   [
-    {Proto, <<"http">>}, %% TODO
+    format_forwarded_proto(Req, Proto),
     format_forwarded_host(Req, Host),
     format_forwarded_port(Req, Port),
     format_forwarded_path(Req, Path)
   ].
+
+format_forwarded_proto(Req, Header) ->
+  {Header, case cowboy_req:header(Header, Req) of
+    {undefined, _} ->
+      case cowboy_req:get([transport], Req) of
+        [ranch_tcp] ->
+          <<"http">>;
+        _ ->
+          <<"https">>
+      end;
+    {Proto, _} ->
+      Proto
+  end}.
 
 format_forwarded_host(Req, Header) ->
   {Header, case cowboy_req:header(Header, Req) of
@@ -292,7 +305,7 @@ format_forwarded_port(Req, Header) ->
       [Port] = cowboy_req:get([port], Req),
       integer_to_binary(Port);
     {Port, _} ->
-      integer_to_binary(Port)
+      Port
   end}.
 
 format_forwarded_path(Req, Header) ->
