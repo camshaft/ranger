@@ -97,11 +97,12 @@ format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
   next(Req3, State, fun append_qs/2).
 
 append_qs(Req, State) ->
+  {Path, _} = cowboy_req:meta(backend_path, Req),
   case cowboy_req:qs(Req) of
     {<<>>, _} ->
-      next(Req, State, fun forwarded_header_prefix/2);
+      Req2 = cowboy_req:set_meta(backend_path_qs, Path, Req),
+      next(Req2, State, fun forwarded_header_prefix/2);
     {QS, _} ->
-      {Path, _} = cowboy_req:meta(backend_path, Req),
       Req2 = cowboy_req:set_meta(backend_path_qs, <<Path/binary, "?", QS/binary>>, Req),
       next(Req2, State, fun forwarded_header_prefix/2)
   end.
@@ -267,58 +268,57 @@ chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) -
 
 %% Formatting
 format_forwarded_headers(Req, {Proto, Host, Port, Path}) ->
-  [
-    format_forwarded_proto(Req, Proto),
-    format_forwarded_host(Req, Host),
-    format_forwarded_port(Req, Port),
-    format_forwarded_path(Req, Path)
-  ].
+  format_forwarded_proto(Req, Proto) ++
+  format_forwarded_host(Req, Host) ++
+  format_forwarded_port(Req, Port) ++
+  format_forwarded_path(Req, Path).
 
 format_forwarded_proto(Req, Header) ->
-  {Header, case cowboy_req:header(Header, Req) of
+  case cowboy_req:header(Header, Req) of
     {undefined, _} ->
       case cowboy_req:get([transport], Req) of
         [ranch_tcp] ->
-          <<"http">>;
+          [{Header, <<"http">>}];
         _ ->
-          <<"https">>
+          [{Header, <<"https">>}]
       end;
-    {Proto, _} ->
-      Proto
-  end}.
+    _ ->
+      []
+  end.
 
 format_forwarded_host(Req, Header) ->
-  {Header, case cowboy_req:header(Header, Req) of
+  case cowboy_req:header(Header, Req) of
     {undefined, _} ->
       [Host] = cowboy_req:get([host], Req),
-      Host;
-    {Host, _} ->
-      Host
-  end}.
+      [{Header, Host}];
+    _ ->
+      []
+  end.
 
 format_forwarded_port(Req, Header) ->
-  {Header, case cowboy_req:header(Header, Req) of
+  case cowboy_req:header(Header, Req) of
     {undefined, _} ->
       [Port] = cowboy_req:get([port], Req),
-      integer_to_binary(Port);
-    {Port, _} ->
-      Port
-  end}.
+      [{Header, integer_to_binary(Port)}];
+    _ ->
+      []
+  end.
 
 format_forwarded_path(Req, Header) ->
-  {Header, case cowboy_req:header(Header, Req) of
+  case cowboy_req:header(Header, Req) of
     {undefined, _} ->
       [Path] = cowboy_req:get([path], Req),
       {BackendPath, _} = cowboy_req:meta(backend_path, Req),
-      binary:part(Path, {0, byte_size(Path) - byte_size(BackendPath)});
-    {Path, _} ->
-      Path
-  end}.
+      FPath = binary:part(Path, {0, byte_size(Path) - byte_size(BackendPath)}),
+      [{Header, FPath}];
+    _ ->
+      []
+  end.
 
 %% internal.
 
 path_join(BasePath, undefined) ->
-  BasePath;
+  [BasePath];
 path_join(<<>>, Parts) ->
   [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
 path_join(<<"/">>, Parts) ->
@@ -441,7 +441,8 @@ error_terminate(Req, State = #state{handler = Handler, handler_state = HandlerSt
 
 proxy_terminate(Req, #state{handler = Handler, handler_state = HandlerState}) ->
   case erlang:function_exported(Handler, proxy_terminate, 2) of
-    true -> ok = Handler:proxy_terminate(
-      cowboy_req:lock(Req), HandlerState);
-    false -> ok
+    true ->
+      ok = Handler:proxy_terminate(cowboy_req:lock(Req), HandlerState);
+    false ->
+      ok
   end.
