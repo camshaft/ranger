@@ -75,6 +75,8 @@ timeout(Req, State = #state{backend = Backend}) ->
       next(Req2, State2, fun open_connection/2)
   end.
 
+open_connection(Req, State = #state{backend = Conn}) when is_pid(Conn) ->
+  next(Req, State#state{conn = Conn}, fun format_path/2);
 open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeout = Timeout}) ->
   Opts = [
     {retry, fast_key:get(retry, State#state.env, 1)},
@@ -83,10 +85,9 @@ open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeou
   ],
   case gun:open(Host, Port, Opts) of
     {ok, Conn} ->
-      %% TODO handle a closed upstream connection
       next(Req, State#state{conn = Conn}, fun format_path/2);
-    {error, _Error} ->
-      next(Req, State, 502)
+    {error, Reason} ->
+      error_terminate(Req, State, error, Reason, open_connection, 2, 502)
   end.
 
 format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
@@ -336,6 +337,8 @@ filter_headers([Header|Headers], Acc) ->
   filter_headers(Headers, [Header|Acc]).
 
 %% TODO support more combos
+normalize_backend(Conn) when is_pid(Conn) ->
+  Conn;
 normalize_backend({Proto, Host, Port, Path}) ->
   {Proto, Host, Port, Path};
 normalize_backend({Proto, Host, Port}) when is_atom(Proto) andalso is_integer(Port) ->
@@ -394,6 +397,9 @@ respond(Req, State, StatusCode) ->
   {ok, Req2} = cowboy_req:reply(StatusCode, Req),
   terminate(Req2, State).
 
+terminate(Req, State = #state{env = Env, conn = Conn, backend = Conn}) ->
+  proxy_terminate(Req, State),
+  {ok, Req, [{result, ok}|Env]};
 terminate(Req, State = #state{env = Env, conn = Conn}) ->
   proxy_terminate(Req, State),
   ok = gun:close(Conn),
