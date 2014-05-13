@@ -188,8 +188,8 @@ transform_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
       ok = gun:data(Conn, Ref, fin, Body2),
       next(Req3, State#state{handler_state = HandlerState}, fun res_status/2);
     {error, chunked} ->
-      %% TODO buffer the body
-      terminate(Req, State);
+      %% TODO buffer this and call `req_body/3`
+      next(Req, State, fun chunk_req_body/2);
     {error, badlength} ->
       next(Req, State, 413)
   end.
@@ -246,8 +246,7 @@ transform_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout
   case gun:await_body(Conn, Ref, Timeout) of
     {ok, Body} ->
       {Body2, Req2, HandlerState} = call(Req, State, res_body, Body),
-      ok = cowboy_req:chunk(Body2, Req2),
-      terminate(Req, State#state{handler_state = HandlerState});
+      send(Req2, State#state{handler_state = HandlerState}, Body2, fun terminate/2);
     {error, timeout} ->
       next(Req, State, 504);
     {error, Reason} ->
@@ -257,11 +256,9 @@ transform_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout
 chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) ->
   case gun:await(Conn, Ref, Timeout) of
     {data, nofin, Data} ->
-      ok = cowboy_req:chunk(Data, Req),
-      chunk_res_body(Req, State);
+      send(Req, State, Data, fun chunk_res_body/2);
     {data, fin, Data} ->
-      ok = cowboy_req:chunk(Data, Req),
-      terminate(Req, State);
+      send(Req, State, Data, fun terminate/2);
     {error, timeout} ->
       next(Req, State, 504);
     {error, Reason} ->
@@ -396,6 +393,16 @@ call(Req, State = #state{handler = Handler, handler_state = HandlerState}, Callb
       end;
     false ->
       no_call
+  end.
+
+send(Req, State, Data, Next) ->
+  case cowboy_req:chunk(Data, Req) of
+    ok ->
+      next(Req, State, Next);
+    {error, closed} ->
+      terminate(Req, State);
+    {error, Reason} ->
+      error_terminate(Req, State, error, Reason, send, 4)
   end.
 
 exported(_Req, _State = #state{handler = Handler}, Callback, Arity) ->
