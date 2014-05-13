@@ -309,10 +309,22 @@ format_forwarded_path(Req, Header) ->
     {undefined, _} ->
       [Path] = cowboy_req:get([path], Req),
       {BackendPath, _} = cowboy_req:meta(backend_path, Req),
-      FPath = binary:part(Path, {0, byte_size(Path) - byte_size(BackendPath)}),
-      [{Header, FPath}];
+      [{Header, binary:part(Path, {0, backend_size(Path, BackendPath)})}];
     _ ->
       []
+  end.
+
+backend_size(Path, BackendPath) ->
+  case BackendPath of
+    <<>> ->
+      byte_size(Path);
+    <<"/">> ->
+      byte_size(Path);
+    _ ->
+      byte_size(Path) - byte_size(BackendPath)
+  end - case binary:last(Path) of
+    $/ -> 1;
+    _ -> 0
   end.
 
 %% internal.

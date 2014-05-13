@@ -7,6 +7,7 @@
 -export([forwarded_header_prefix/2]).
 -export([request_id/2]).
 -export([req_headers/3]).
+-export([res_headers/3]).
 
 -define(CONNECT_TIMEOUT, 5000).
 
@@ -34,8 +35,8 @@ req_headers(Headers, Req, State) ->
 % req_body(Body, Req, State) ->
 %   {Body, Req, State}.
 
-% res_headers(Headers, Req, State) ->
-%   {Headers, Req, State}.
+res_headers(Headers, Req, State) ->
+  {lists:keydelete(<<"content-security-policy">>, 1, Headers), Req, State}.
 
 % res_body(Body, Req, State) ->
 %   {Body, Req, State}.
