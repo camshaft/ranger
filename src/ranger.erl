@@ -90,11 +90,20 @@ open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeou
   end.
 
 format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
-  %% TODO add the cowboy_req:qs
   {Parts, Req2} = cowboy_req:path_info(Req),
   Path = list_to_binary(path_join(BasePath, Parts)),
   Req3 = cowboy_req:set_meta(backend_path, Path, Req2),
-  next(Req3, State, fun forwarded_header_prefix/2).
+  next(Req3, State, fun append_qs/2).
+
+append_qs(Req, State) ->
+  case cowboy_req:qs(Req) of
+    {<<>>, _} ->
+      next(Req, State, fun forwarded_header_prefix/2);
+    {QS, _} ->
+      {Path, _} = cowboy_req:meta(backend_path, Req),
+      Req2 = cowboy_req:set_meta(backend_path_qs, <<Path/binary, "?", QS/binary>>, Req),
+      next(Req2, State, fun forwarded_header_prefix/2)
+  end.
 
 forwarded_header_prefix(Req, State = #state{req_headers = ReqHeaders}) ->
   case call(Req, State, forwarded_header_prefix) of
@@ -121,6 +130,11 @@ request_id(Req, State = #state{req_headers = ReqHeaders, res_headers = ResHeader
   case call(Req, State, request_id) of
     no_call ->
       next(Req, State, fun req_headers/2);
+    {{ReqName, ResName, ID}, Req2, HandlerState} ->
+      State2 = State#state{handler_state = HandlerState,
+                           req_headers = [{ReqName, ID}|ReqHeaders],
+                           res_headers = [{ResName, ID}|ResHeaders]},
+      next(Req2, State2, fun req_headers/2);
     {{Name, ID}, Req2, HandlerState} ->
       State2 = State#state{handler_state = HandlerState,
                            req_headers = [{Name, ID}|ReqHeaders],
@@ -144,7 +158,8 @@ req_headers(Req, State = #state{req_headers = ReqHeaders}) ->
   end.
 
 init_request(Req, State = #state{conn = Conn, method = Method, req_headers = Headers}) ->
-  {Path, _} = cowboy_req:meta(backend_path, Req),
+  {Path, _} = cowboy_req:meta(backend_path_qs, Req),
+  %% io:format("~p ~p~n~n~p~n", [Method, Path, Headers]),
   Ref = gun:request(Conn, Method, Path, Headers),
   next(Req, State#state{ref = Ref}, fun req_body/2).
 
