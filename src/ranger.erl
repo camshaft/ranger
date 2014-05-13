@@ -49,30 +49,20 @@ start() ->
   -> {ok, Req, Env} | {error, 500, Req}
   when Req::cowboy_req:req(), Env::cowboy_middleware:env().
 upgrade(Req, Env, Handler, HandlerOpts) ->
-  try
-    [Method, Headers] = cowboy_req:get([method, headers], Req),
-    case erlang:function_exported(Handler, proxy_init, 2) of
-      true ->
-        try Handler:proxy_init(Req, HandlerOpts) of
-          {ok, Req2, HandlerState} ->
-            backend(Req2, #state{env=Env, method=Method, req_headers=Headers,
-              handler=Handler, handler_state=HandlerState})
-        catch Class:Reason ->
-          error_logger:error_msg(
-            "** Cowboy handler ~p terminating in ~p/~p~n"
-            "   for the reason ~p:~p~n** Options were ~p~n"
-            "** Request was ~p~n** Stacktrace: ~p~n~n",
-            [Handler, proxy_init, 2, Class, Reason, HandlerOpts,
-              cowboy_req:to_list(Req), erlang:get_stacktrace()]),
-          {error, 500, Req}
-        end;
-      false ->
-        backend(Req, #state{env=Env, method=Method,
-          handler=Handler})
-    end
-  catch
-    throw:{?MODULE, error} ->
-      {error, 500, Req}
+  [Method, Headers] = cowboy_req:get([method, headers], Req),
+  case erlang:function_exported(Handler, proxy_init, 2) of
+    true ->
+      try Handler:proxy_init(Req, HandlerOpts) of
+        {ok, Req2, HandlerState} ->
+          backend(Req2, #state{env=Env, method=Method, req_headers=Headers,
+            handler=Handler, handler_state=HandlerState})
+      catch Class:Reason ->
+        error_terminate(Req, #state{handler = Handler, handler_state = HandlerOpts},
+            Class, Reason, proxy_init, 3)
+      end;
+    false ->
+      backend(Req, #state{env=Env, method=Method,
+        handler=Handler})
   end.
 
 backend(Req, State) ->
@@ -322,13 +312,7 @@ call(Req, State=#state{handler=Handler, handler_state=HandlerState}, Callback) -
       try
         Handler:Callback(Req, HandlerState)
       catch Class:Reason ->
-        error_logger:error_msg(
-          "** Cowboy handler ~p terminating in ~p/~p~n"
-          "   for the reason ~p:~p~n** Handler state was ~p~n"
-          "** Request was ~p~n** Stacktrace: ~p~n~n",
-          [Handler, Callback, 2, Class, Reason, HandlerState,
-            cowboy_req:to_list(Req), erlang:get_stacktrace()]),
-        error_terminate(Req, State)
+        error_terminate(Req, State, Class, Reason, Callback, 2)
       end;
     false ->
       no_call
@@ -340,13 +324,7 @@ call(Req, State=#state{handler=Handler, handler_state=HandlerState}, Callback, A
       try
         Handler:Callback(Arg, Req, HandlerState)
       catch Class:Reason ->
-        error_logger:error_msg(
-          "** Cowboy handler ~p terminating in ~p/~p~n"
-          "   for the reason ~p:~p~n** Handler state was ~p~n"
-          "** Request was ~p~n** Stacktrace: ~p~n~n",
-          [Handler, Callback, 2, Class, Reason, HandlerState,
-            cowboy_req:to_list(Req), erlang:get_stacktrace()]),
-        error_terminate(Req, State)
+        error_terminate(Req, State, Class, Reason, Callback, 3)
       end;
     false ->
       no_call
@@ -357,9 +335,6 @@ exported(_Req, _State = #state{handler=Handler}, Callback, Arity) ->
 
 next(Req, State, Next) when is_function(Next) ->
   Next(Req, State);
-next(Req, State, StatusCode) when is_integer(StatusCode) andalso StatusCode >= 500 ->
-  {ok, Req2} = cowboy_req:reply(StatusCode, Req),
-  error_terminate(Req2, State);
 next(Req, State, StatusCode) when is_integer(StatusCode) ->
   respond(Req, State, StatusCode).
 
@@ -380,10 +355,17 @@ terminate(Req, State=#state{env=Env, conn = Conn}) ->
   gen_tcp:close(Conn),
   {ok, Req, [{result, ok}|Env]}.
 
--spec error_terminate(cowboy_req:req(), #state{}) -> no_return().
-error_terminate(Req, State) ->
+error_terminate(Req, State=#state{handler=Handler, handler_state=HandlerState},
+		Class, Reason, Callback, Arity) ->
   proxy_terminate(Req, State),
-  erlang:raise(throw, {?MODULE, error}, erlang:get_stacktrace()).
+  cowboy_req:maybe_reply(500, Req),
+  erlang:Class([
+    {reason, Reason},
+    {mfa, {Handler, Callback, Arity}},
+    {stacktrace, erlang:get_stacktrace()},
+    {req, cowboy_req:to_list(Req)},
+    {state, HandlerState}
+  ]).
 
 proxy_terminate(Req, #state{handler=Handler, handler_state=HandlerState}) ->
   case erlang:function_exported(Handler, proxy_terminate, 2) of
