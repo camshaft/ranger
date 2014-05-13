@@ -1,8 +1,5 @@
 -module(ranger).
 
-%% Test App.
--export([start/0]).
-
 %% API.
 -export([upgrade/4]).
 
@@ -23,20 +20,8 @@
 
   res_status :: integer(),
   res_headers = [] :: [{iolist(), iolist()}],
-
-  res_body_fun :: fun(),
-  res_sent_bytes = 0 :: integer(),
-  length = 0
+  res_has_body :: boolean()
 }).
-
-%% Test App.
-
-start() ->
-  ok = application:start(crypto),
-  ok = application:start(sasl),
-  ok = application:start(ranch),
-  ok = application:start(cowboy),
-  ok = application:start(ranger).
 
 %% @doc Upgrade a HTTP request to the proxy protocol.
 %%
@@ -52,7 +37,7 @@ upgrade(Req, Env, Handler, HandlerOpts) ->
     true ->
       try Handler:proxy_init(Req, HandlerOpts) of
         {ok, Req2, HandlerState} ->
-          backend(Req2, #state{env = Env, method = Method, req_headers = Headers,
+          backend(Req2, #state{env = Env, method = Method, req_headers = filter_headers(Headers, []),
             handler = Handler, handler_state = HandlerState})
       catch Class:Reason ->
         error_terminate(Req, #state{handler = Handler, handler_state = HandlerOpts},
@@ -80,18 +65,6 @@ backend(Req, State) ->
       next(Req2, State2, fun timeout/2)
   end.
 
-%% TODO support more combos
-normalize_backend({Proto, Host, Port, Path}) ->
-  {Proto, Host, Port, Path};
-normalize_backend({Proto, Host, Port}) when is_atom(Proto) andalso is_integer(Port) ->
-  {Proto, Host, Port, <<>>};
-normalize_backend({Host, Port}) when is_integer(Port) ->
-  {http, Host, Port, <<>>};
-normalize_backend({http, Host}) ->
-  {http, Host, 80, <<>>};
-normalize_backend({Proto, Host}) when is_atom(Proto) ->
-  {Proto, Host, 443, <<>>}.
-
 timeout(Req, State = #state{backend = Backend}) ->
   case call(Req, State, timeout, Backend) of
     no_call ->
@@ -111,26 +84,34 @@ open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeou
   case gun:open(Host, Port, Opts) of
     {ok, Conn} ->
       %% TODO handle a closed upstream connection
-      next(Req, State#state{conn = Conn}, fun forwarded_header_prefix/2);
+      next(Req, State#state{conn = Conn}, fun format_path/2);
     {error, _Error} ->
       next(Req, State, 502)
   end.
 
-type_from_proto(http) ->
-  tcp;
-type_from_proto(https) ->
-  ssl;
-type_from_proto(spdy) ->
-  tcp_spdy;
-type_from_proto(Proto) ->
-  Proto.
+format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
+  %% TODO add the cowboy_req:qs
+  {Parts, Req2} = cowboy_req:path_info(Req),
+  Path = list_to_binary(path_join(BasePath, Parts)),
+  Req3 = cowboy_req:set_meta(backend_path, Path, Req2),
+  next(Req3, State, fun forwarded_header_prefix/2).
 
 forwarded_header_prefix(Req, State = #state{req_headers = ReqHeaders}) ->
   case call(Req, State, forwarded_header_prefix) of
     no_call ->
       next(Req, State, fun request_id/2);
-    {Prefix, Req2, HandlerState} ->
-      ForwardedHeaders = format_forwarded_headers(Req, Prefix),
+    {{_, _, _, _} = Headers, Req2, HandlerState} ->
+      ForwardedHeaders = format_forwarded_headers(Req, Headers),
+      State2 = State#state{handler_state = HandlerState,
+                           req_headers = ForwardedHeaders ++ ReqHeaders},
+      next(Req2, State2, fun request_id/2);
+    {Prefix, Req2, HandlerState} when is_binary(Prefix) ->
+      ForwardedHeaders = format_forwarded_headers(Req, {
+        <<Prefix/binary, "-proto">>,
+        <<Prefix/binary, "-host">>,
+        <<Prefix/binary, "-port">>,
+        <<Prefix/binary, "-path">>
+      }),
       State2 = State#state{handler_state = HandlerState,
                            req_headers = ForwardedHeaders ++ ReqHeaders},
       next(Req2, State2, fun request_id/2)
@@ -153,49 +134,19 @@ request_id(Req, State = #state{req_headers = ReqHeaders, res_headers = ResHeader
   end.
 
 req_headers(Req, State = #state{req_headers = ReqHeaders}) ->
-  %% TODO filter headers - connection, host, content-length
-  ReqHeaders2 = filter_headers(ReqHeaders, []),
-  case call(Req, State, req_headers, ReqHeaders2) of
+  case call(Req, State, req_headers, ReqHeaders) of
     no_call ->
-      next(Req, State#state{req_headers = ReqHeaders2}, fun init_request/2);
-    {ReqHeaders3, Req2, HandlerState} ->
+      next(Req, State, fun init_request/2);
+    {ReqHeaders2, Req2, HandlerState} ->
       State2 = State#state{handler_state = HandlerState,
-                           req_headers = ReqHeaders3},
+                           req_headers = ReqHeaders2},
       next(Req2, State2, fun init_request/2)
   end.
 
-filter_headers([], Acc) ->
-  Acc;
-filter_headers([{<<"host">>, _}|Headers], Acc) ->
-  filter_headers(Headers, Acc);
-filter_headers([{<<"connection">>, _}|Headers], Acc) ->
-  filter_headers(Headers, Acc);
-filter_headers([{<<"content-length">>, _}|Headers], Acc) ->
-  filter_headers(Headers, Acc);
-filter_headers([Header|Headers], Acc) ->
-  filter_headers(Headers, [Header|Acc]).
-
-init_request(Req, State = #state{conn = Conn, method = Method, backend = {_, _, _, BasePath}, req_headers = Headers}) ->
-  {Parts, Req2} = cowboy_req:path_info(Req),
-  Path = path_join(BasePath, Parts),
-  %% TODO add the cowboy_req:qs
-  io:format("~n~p ~p~n~p~n", [Method, Path, Headers]),
+init_request(Req, State = #state{conn = Conn, method = Method, req_headers = Headers}) ->
+  {Path, _} = cowboy_req:meta(backend_path, Req),
   Ref = gun:request(Conn, Method, Path, Headers),
-  next(Req2, State#state{ref = Ref}, fun req_body/2).
-
-path_join(<<>>, Parts) ->
-  [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
-path_join(<<"/">>, Parts) ->
-  [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
-path_join(BasePath, Parts) ->
-  io_join(lists:reverse([BasePath|Parts]), <<"/">>, []).
-
-io_join([], _Sep, Acc) ->
-  Acc;
-io_join([Item], _Sep, Acc) ->
-  [Item, Acc];
-io_join([Item|Items], Sep, Acc) ->
-  io_join(Items, Sep, [Sep, Item, Acc]).
+  next(Req, State#state{ref = Ref}, fun req_body/2).
 
 req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
   case cowboy_req:has_body(Req) of
@@ -221,7 +172,7 @@ chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
       ok = gun:data(Conn, Ref, nofin, Body),
       chunk_req_body(Req2, State);
     {done, Req2} ->
-      ok = gun:date(Conn, Ref, fin, <<>>),
+      ok = gun:data(Conn, Ref, fin, <<>>),
       next(Req2, State, fun res_status/2);
     {error, _Reason} ->
       %% TODO send back a better error message
@@ -230,31 +181,36 @@ chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
 
 res_status(Req, State = #state{conn = Conn, ref = Ref, timeout = _Timeout, res_headers = ResHeaders}) ->
   receive
-    {gun_response, Conn, Ref, _Fin, Status, Headers} ->
-      %% TODO handle if fin
-      next(Req, State#state{res_status = Status, res_headers = Headers ++ ResHeaders}, fun res_headers/2)
+    {gun_response, Conn, Ref, Fin, Status, Headers} ->
+      next(Req, State#state{res_status = Status,
+                            res_headers = filter_headers(Headers, ResHeaders),
+                            res_has_body = Fin =:= nofin}, fun res_headers/2)
   %% after Timeout TODO
   end.
 
-res_headers(Req, State = #state{res_status = ResStatus, res_headers = ResHeaders}) ->
-  %% TODO filter the response headers - connection, content-length, date?
-
-  {ManipulatedHeaders, Req2, State2} = case call(Req, State, res_headers, ResHeaders) of
+res_headers(Req, State = #state{res_headers = ResHeaders}) ->
+  case call(Req, State, res_headers, ResHeaders) of
     no_call ->
-      {ResHeaders, Req, State};
-    Result ->
-      Result
-  end,
-  {ok, Req3} = cowboy_req:chunked_reply(ResStatus, ManipulatedHeaders, Req2),
-  next(Req3, State2, fun get_res_body/2).
+      next(Req, State, fun reply/2);
+    {FilteredHeaders, Req2, HandlerState} ->
+      next(Req2, State#state{handler_state = HandlerState,
+                             res_headers = FilteredHeaders}, fun reply/2)
+  end.
 
-get_res_body(Req, State) ->
+reply(Req, State = #state{res_status = Status, res_headers = Headers, res_has_body = true}) ->
+  {ok, Req2} = cowboy_req:chunked_reply(Status, Headers, Req),
+  next(Req2, State, fun res_body/2);
+reply(Req, State = #state{res_status = Status, res_headers = Headers}) ->
+  {ok, Req2} = cowboy_req:reply(Status, Headers, Req),
+  terminate(Req2, State).
+
+res_body(Req, State) ->
   case exported(Req, State, res_body, 3) of
     true ->
       %% TODO
       ok;
     _ ->
-      stream_body(Req, State)
+      next(Req, State, fun stream_body/2)
   end.
 
 stream_body(Req, State = #state{conn = Conn, ref = Ref, timeout = _Timeout}) ->
@@ -269,19 +225,97 @@ stream_body(Req, State = #state{conn = Conn, ref = Ref, timeout = _Timeout}) ->
   end.
 
 %% Formatting
-format_forwarded_headers(Req, Prefix) ->
-  %% TODO this is wrong. fix this to use the values from the upstream request
-  [Host, Port, Path] = cowboy_req:get([host, port, path], Req),
+format_forwarded_headers(Req, {Proto, Host, Port, Path}) ->
   [
-    {<<Prefix/binary, "-proto">>, <<"http">>}, %% TODO
-    {<<Prefix/binary, "-host">>, Host},
-    {<<Prefix/binary, "-port">>, integer_to_binary(Port)},
-    {<<Prefix/binary, "-path">>, Path}
+    {Proto, <<"http">>}, %% TODO
+    format_forwarded_host(Req, Host),
+    format_forwarded_port(Req, Port),
+    format_forwarded_path(Req, Path)
   ].
+
+format_forwarded_host(Req, Header) ->
+  {Header, case cowboy_req:header(Header, Req) of
+    {undefined, _} ->
+      [Host] = cowboy_req:get([host], Req),
+      Host;
+    {Host, _} ->
+      Host
+  end}.
+
+format_forwarded_port(Req, Header) ->
+  {Header, case cowboy_req:header(Header, Req) of
+    {undefined, _} ->
+      [Port] = cowboy_req:get([port], Req),
+      integer_to_binary(Port);
+    {Port, _} ->
+      integer_to_binary(Port)
+  end}.
+
+format_forwarded_path(Req, Header) ->
+  {Header, case cowboy_req:header(Header, Req) of
+    {undefined, _} ->
+      [Path] = cowboy_req:get([path], Req),
+      {BackendPath, _} = cowboy_req:meta(backend_path, Req),
+      binary:part(Path, {0, byte_size(Path) - byte_size(BackendPath)});
+    {Path, _} ->
+      Path
+  end}.
+
+%% internal.
+
+path_join(BasePath, undefined) ->
+  BasePath;
+path_join(<<>>, Parts) ->
+  [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
+path_join(<<"/">>, Parts) ->
+  [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
+path_join(BasePath, Parts) ->
+  io_join(lists:reverse([BasePath|Parts]), <<"/">>, []).
+
+io_join([], _Sep, Acc) ->
+  Acc;
+io_join([Item], _Sep, Acc) ->
+  [Item, Acc];
+io_join([Item|Items], Sep, Acc) ->
+  io_join(Items, Sep, [Sep, Item, Acc]).
+
+filter_headers([], Acc) ->
+  Acc;
+filter_headers([{<<"host">>, _}|Headers], Acc) ->
+  filter_headers(Headers, Acc);
+filter_headers([{<<"connection">>, _}|Headers], Acc) ->
+  filter_headers(Headers, Acc);
+filter_headers([{<<"content-length">>, _}|Headers], Acc) ->
+  filter_headers(Headers, Acc);
+filter_headers([{<<"date">>, _}|Headers], Acc) ->
+  filter_headers(Headers, Acc);
+filter_headers([Header|Headers], Acc) ->
+  filter_headers(Headers, [Header|Acc]).
+
+%% TODO support more combos
+normalize_backend({Proto, Host, Port, Path}) ->
+  {Proto, Host, Port, Path};
+normalize_backend({Proto, Host, Port}) when is_atom(Proto) andalso is_integer(Port) ->
+  {Proto, Host, Port, <<>>};
+normalize_backend({Host, Port}) when is_integer(Port) ->
+  {http, Host, Port, <<>>};
+normalize_backend({http, Host}) ->
+  {http, Host, 80, <<>>};
+normalize_backend({Proto, Host}) when is_atom(Proto) ->
+  {Proto, Host, 443, <<>>}.
+
+type_from_proto(http) ->
+  tcp;
+type_from_proto(https) ->
+  ssl;
+type_from_proto(spdy) ->
+  tcp_spdy;
+type_from_proto(Proto) ->
+  Proto.
 
 %% Protocol
 
-call(Req, State=#state{handler=Handler, handler_state=HandlerState}, Callback) ->
+call(Req, State = #state{handler = Handler, handler_state = HandlerState}, Callback) ->
   case erlang:function_exported(Handler, Callback, 2) of
     true ->
       try
@@ -293,7 +327,7 @@ call(Req, State=#state{handler=Handler, handler_state=HandlerState}, Callback) -
       no_call
   end.
 
-call(Req, State=#state{handler=Handler, handler_state=HandlerState}, Callback, Arg) ->
+call(Req, State = #state{handler = Handler, handler_state = HandlerState}, Callback, Arg) ->
   case erlang:function_exported(Handler, Callback, 3) of
     true ->
       try
@@ -322,7 +356,7 @@ terminate(Req, State = #state{env = Env, conn = Conn}) ->
   ok = gun:close(Conn),
   {ok, Req, [{result, ok}|Env]}.
 
-error_terminate(Req, State=#state{handler=Handler, handler_state=HandlerState},
+error_terminate(Req, State = #state{handler = Handler, handler_state = HandlerState},
 		Class, Reason, Callback, Arity) ->
   proxy_terminate(Req, State),
   cowboy_req:maybe_reply(500, Req),
@@ -334,7 +368,7 @@ error_terminate(Req, State=#state{handler=Handler, handler_state=HandlerState},
     {state, HandlerState}
   ]).
 
-proxy_terminate(Req, #state{handler=Handler, handler_state=HandlerState}) ->
+proxy_terminate(Req, #state{handler = Handler, handler_state = HandlerState}) ->
   case erlang:function_exported(Handler, proxy_terminate, 2) of
     true -> ok = Handler:proxy_terminate(
       cowboy_req:lock(Req), HandlerState);
