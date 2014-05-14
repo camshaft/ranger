@@ -162,23 +162,21 @@ req_headers(Req, State = #state{req_headers = ReqHeaders}) ->
 init_request(Req, State = #state{conn = Conn, method = Method, req_headers = Headers}) ->
   {Path, _} = cowboy_req:meta(backend_path_qs, Req),
   %% io:format("~p ~p~n~n~p~n", [Method, Path, Headers]),
-  Ref = gun:request(Conn, Method, Path, Headers),
-  next(Req, State#state{ref = Ref}, fun req_body/2).
-
-req_body(Req, State = #state{conn = Conn, ref = Ref, method = Method}) ->
   case cowboy_req:has_body(Req) of
     true ->
-      case exported(Req, State, req_body, 3) of
-        true ->
-          next(Req, State, fun transform_req_body/2);
-        _ ->
-          next(Req, State, fun chunk_req_body/2)
-      end;
-    _ when Method =:= <<"POST">> orelse Method =:= <<"PUT">> orelse Method =:= <<"PATCH">> ->
-      ok = gun:data(Conn, Ref, fin, []),
-      next(Req, State, fun res_status/2);
+      Ref = gun:request(Conn, Method, Path, [{<<"transfer-encoding">>, <<"chunked">>}|Headers]),
+      next(Req, State#state{ref = Ref}, fun req_body/2);
     _ ->
-      next(Req, State, fun res_status/2)
+      Ref = gun:request(Conn, Method, Path, Headers),
+      next(Req, State#state{ref = Ref}, fun res_status/2)
+  end.
+
+req_body(Req, State) ->
+  case exported(Req, State, req_body, 3) of
+    true ->
+      next(Req, State, fun transform_req_body/2);
+    _ ->
+      next(Req, State, fun chunk_req_body/2)
   end.
 
 transform_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
