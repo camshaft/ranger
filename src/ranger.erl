@@ -48,6 +48,8 @@ upgrade(Req, Env, Handler, HandlerOpts) ->
         handler = Handler})
   end.
 
+%% Init.
+
 %% select a backend. this can come from the router options or can be returned from the 'backend/2' method
 backend(Req, State) ->
   case call(Req, State, backend) of
@@ -89,6 +91,8 @@ open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeou
     {error, Reason} ->
       error_terminate(Req, State, error, Reason, open_connection, 2, 502)
   end.
+
+%% Request.
 
 format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
   {Parts, Req2} = cowboy_req:path_info(Req),
@@ -205,6 +209,8 @@ chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
       error_terminate(Req, State, error, Reason, chunk_req_body, 2, 400)
   end.
 
+%% Response.
+
 res_status(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout, res_headers = ResHeaders}) ->
   case gun:await(Conn, Ref, Timeout) of
     {response, Fin, Status, Headers} ->
@@ -268,7 +274,8 @@ chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) -
       error_terminate(Req, State, error, Reason, res_status, 2, 502)
   end.
 
-%% Formatting
+%% Formatting.
+
 format_forwarded_headers(Req, {Proto, Host, Port, Path}) ->
   format_forwarded_proto(Req, Proto) ++
   format_forwarded_host(Req, Host) ++
@@ -383,7 +390,7 @@ type_from_proto(spdy) ->
 type_from_proto(Proto) ->
   Proto.
 
-%% Protocol
+%% Protocol.
 
 call(Req, State = #state{handler = Handler, handler_state = HandlerState}, Callback) ->
   case erlang:function_exported(Handler, Callback, 2) of
