@@ -258,6 +258,10 @@ chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) -
       send(Req, State, Data, fun chunk_res_body/2);
     {data, fin, Data} ->
       send(Req, State, Data, fun terminate/2);
+    {push, AssocToStreamRef, Method, Host, Path, Headers} ->
+      error_logger:error_msg("Ignored PUSH ~p ~p ~p ~p ~p~n",
+		[AssocToStreamRef, Method, Host, Path, Headers]),
+      chunk_res_body(Req, State);
     {error, timeout} ->
       next(Req, State, 504);
     {error, Reason} ->
