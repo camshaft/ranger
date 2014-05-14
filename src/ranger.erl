@@ -77,8 +77,8 @@ timeout(Req, State = #state{backend = Backend}) ->
       next(Req2, State2, fun open_connection/2)
   end.
 
-open_connection(Req, State = #state{backend = Conn}) when is_pid(Conn) ->
-  next(Req, State#state{conn = Conn}, fun format_path/2);
+open_connection(Req, State = #state{backend = {Conn, Path}}) when is_pid(Conn) ->
+  next(Req, State#state{conn = Conn, backend = {pid, pid, pid, Path}}, fun format_path/2);
 open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeout = Timeout}) ->
   Opts = [
     {retry, fast_key:get(retry, State#state.env, 1)},
@@ -369,7 +369,9 @@ filter_headers([Header|Headers], Acc) ->
 
 %% TODO support more combos
 normalize_backend(Conn) when is_pid(Conn) ->
-  Conn;
+  {Conn, <<"/">>};
+normalize_backend({Conn, Path}) when is_pid(Conn) ->
+  {Conn, Path};
 normalize_backend({Proto, Host, Port, Path}) ->
   {Proto, Host, Port, Path};
 normalize_backend({Proto, Host, Port}) when is_atom(Proto) andalso is_integer(Port) ->
