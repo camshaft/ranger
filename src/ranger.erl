@@ -23,6 +23,11 @@
   res_has_body :: boolean()
 }).
 
+-define(HANDLE_ERROR(State),
+  {error, ExitStatus, HandlerReq} when is_integer(ExitStatus) ->
+    next(HandlerReq, State, ExitStatus)
+).
+
 %% @doc Upgrade a HTTP request to the proxy protocol.
 %%
 %% You do not need to call this function manually. To upgrade to the proxy
@@ -61,6 +66,7 @@ backend(Req, State) ->
           State2 = State#state{backend = normalize_backend(Backend)},
           next(Req, State2, fun timeout/2)
       end;
+    ?HANDLE_ERROR(State);
     {Backend, Req2, HandlerState} ->
       State2 = State#state{handler_state = HandlerState,
                            backend = normalize_backend(Backend)},
@@ -71,6 +77,7 @@ timeout(Req, State = #state{backend = Backend}) ->
   case call(Req, State, timeout, Backend) of
     no_call ->
       next(Req, State, fun open_connection/2);
+    ?HANDLE_ERROR(State);
     {Timeout, Req2, HandlerState} ->
       State2 = State#state{handler_state = HandlerState,
                            timeout = Timeout},
@@ -115,6 +122,7 @@ forwarded_header_prefix(Req, State = #state{req_headers = ReqHeaders}) ->
   case call(Req, State, forwarded_header_prefix) of
     no_call ->
       next(Req, State, fun request_id/2);
+    ?HANDLE_ERROR(State);
     {{_, _, _, _} = Headers, Req2, HandlerState} ->
       ForwardedHeaders = format_forwarded_headers(Req, Headers),
       State2 = State#state{handler_state = HandlerState,
@@ -136,6 +144,7 @@ request_id(Req, State = #state{req_headers = ReqHeaders, res_headers = ResHeader
   case call(Req, State, request_id) of
     no_call ->
       next(Req, State, fun req_headers/2);
+    ?HANDLE_ERROR(State);
     {{ReqName, ResName, ID}, Req2, HandlerState} ->
       State2 = State#state{handler_state = HandlerState,
                            req_headers = [{ReqName, ID}|ReqHeaders],
@@ -157,6 +166,7 @@ req_headers(Req, State = #state{req_headers = ReqHeaders}) ->
   case call(Req, State, req_headers, ReqHeaders) of
     no_call ->
       next(Req, State, fun init_request/2);
+    ?HANDLE_ERROR(State);
     {ReqHeaders2, Req2, HandlerState} ->
       State2 = State#state{handler_state = HandlerState,
                            req_headers = ReqHeaders2},
@@ -227,6 +237,7 @@ res_headers(Req, State = #state{res_headers = ResHeaders}) ->
   case call(Req, State, res_headers, ResHeaders) of
     no_call ->
       next(Req, State, fun reply/2);
+    ?HANDLE_ERROR(State);
     {FilteredHeaders, Req2, HandlerState} ->
       next(Req2, State#state{handler_state = HandlerState,
                              res_headers = FilteredHeaders}, fun reply/2)
