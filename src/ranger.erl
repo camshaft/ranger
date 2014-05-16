@@ -103,9 +103,10 @@ open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeou
 
 format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
   {Parts, Req2} = cowboy_req:path_info(Req),
-  Path = list_to_binary(path_join(BasePath, Parts)),
-  Req3 = cowboy_req:set_meta(backend_path, Path, Req2),
-  next(Req3, State, fun append_qs/2).
+  Path = path_join(Parts),
+  Req3 = cowboy_req:set_meta(backend_path, path_join_base(BasePath, Path), Req2),
+  Req4 = cowboy_req:set_meta(base_path, Path, Req3),
+  next(Req4, State, fun append_qs/2).
 
 append_qs(Req, State) ->
   {Path, _} = cowboy_req:meta(backend_path, Req),
@@ -328,7 +329,7 @@ format_forwarded_path(Req, Header) ->
   case cowboy_req:header(Header, Req) of
     {undefined, _} ->
       [Path] = cowboy_req:get([path], Req),
-      {BackendPath, _} = cowboy_req:meta(backend_path, Req),
+      {BackendPath, _} = cowboy_req:meta(base_path, Req),
       [{Header, binary:part(Path, {0, backend_size(Path, BackendPath)})}];
     _ ->
       []
@@ -349,14 +350,19 @@ backend_size(Path, BackendPath) ->
 
 %% internal.
 
-path_join(BasePath, undefined) ->
-  [BasePath];
-path_join(<<>>, Parts) ->
-  [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
-path_join(<<"/">>, Parts) ->
-  [<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])];
-path_join(BasePath, Parts) ->
-  io_join(lists:reverse([BasePath|Parts]), <<"/">>, []).
+path_join(undefined) ->
+  <<>>;
+path_join(Parts) ->
+  list_to_binary([<<"/">>, io_join(lists:reverse(Parts), <<"/">>, [])]).
+
+path_join_base(BasePath, <<>>) ->
+  BasePath;
+path_join_base(<<>>, Path) ->
+  Path;
+path_join_base(<<"/">>, Path) ->
+  Path;
+path_join_base(BasePath, Path) ->
+  <<BasePath/binary, Path/binary>>.
 
 io_join([], _Sep, Acc) ->
   Acc;
