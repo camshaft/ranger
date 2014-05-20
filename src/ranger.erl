@@ -15,7 +15,7 @@
   conn :: any(),
   ref :: any(),
   backend :: {atom(), list(), integer(), binary()},
-  timeout = 5000 :: integer(),
+  timeout = 10000 :: integer(),
   req_headers :: [{binary(), binary()}],
 
   res_status :: integer(),
@@ -287,7 +287,7 @@ chunk_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) -
 		[AssocToStreamRef, Method, Host, Path, Headers]),
       chunk_res_body(Req, State);
     {error, timeout} ->
-      next(Req, State, 504);
+      chunk_res_body(Req, State);
     {error, Reason} ->
       error_terminate(Req, State, error, Reason, res_status, 2, 502)
   end.
