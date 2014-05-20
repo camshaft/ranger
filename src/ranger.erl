@@ -85,7 +85,7 @@ timeout(Req, State = #state{backend = Backend}) ->
   end.
 
 open_connection(Req, State = #state{backend = {Conn, Path}}) when is_pid(Conn) ->
-  next(Req, State#state{conn = Conn, backend = {pid, pid, pid, Path}}, fun format_path/2);
+  next(Req, State#state{conn = Conn, backend = {pid, pid, pid, Path}}, fun req_path/2);
 open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeout = Timeout}) ->
   Opts = [
     {retry, fast_key:get(retry, State#state.env, 1)},
@@ -94,19 +94,25 @@ open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeou
   ],
   case gun:open(Host, Port, Opts) of
     {ok, Conn} ->
-      next(Req, State#state{conn = Conn}, fun format_path/2);
+      next(Req, State#state{conn = Conn}, fun req_path/2);
     {error, Reason} ->
       error_terminate(Req, State, error, Reason, open_connection, 2, 502)
   end.
 
 %% Request.
 
-format_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
+req_path(Req, State = #state{backend = {_, _, _, BasePath}}) ->
   {Parts, Req2} = cowboy_req:path_info(Req),
   Path = path_join(Parts),
-  Req3 = cowboy_req:set_meta(backend_path, path_join_base(BasePath, Path), Req2),
-  Req4 = cowboy_req:set_meta(base_path, Path, Req3),
-  next(Req4, State, fun append_qs/2).
+  {Path2, Req2, State2} = case call(Req, State, req_path, Path) of
+    no_call ->
+      {Path, Req, State};
+    {Info, R2, HandlerState} ->
+      {Info, R2, State#state{handler_state = HandlerState}}
+  end,
+  Req3 = cowboy_req:set_meta(backend_path, path_join_base(BasePath, Path2), Req2),
+  Req4 = cowboy_req:set_meta(base_path, Path2, Req3),
+  next(Req4, State2, fun append_qs/2).
 
 append_qs(Req, State) ->
   {Path, _} = cowboy_req:meta(backend_path, Req),
