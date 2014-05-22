@@ -483,7 +483,7 @@ terminate(Req, State = #state{env = Env, conn = Conn, backend = Conn}) ->
   {ok, Req, [{result, ok}|Env]};
 terminate(Req, State = #state{env = Env, conn = Conn}) ->
   proxy_terminate(Req, State),
-  ok = gun:close(Conn),
+  ok = gun:shutdown(Conn),
   {ok, Req, [{result, ok}|Env]}.
 
 error_terminate(Req, State, Class, Reason, Callback, Arity) ->
