@@ -14,6 +14,7 @@
   %% Backend
   conn :: any(),
   ref :: any(),
+  keep_alive = false :: boolean(),
   backend :: {atom(), list(), integer(), binary()},
   timeout = 10000 :: integer(),
   req_headers :: [{binary(), binary()}],
@@ -86,7 +87,7 @@ timeout(Req, State = #state{backend = Backend}) ->
   end.
 
 open_connection(Req, State = #state{backend = {Conn, Path}}) when is_pid(Conn) ->
-  next(Req, State#state{conn = Conn, backend = {pid, pid, pid, Path}}, fun req_path/2);
+  next(Req, State#state{conn = Conn, keep_alive = true, backend = {pid, pid, pid, Path}}, fun req_path/2);
 open_connection(Req, State = #state{backend = {Proto, Host, Port, _Path}, timeout = Timeout}) ->
   Opts = [
     {retry, fast_key:get(retry, State#state.env, 1)},
@@ -478,7 +479,7 @@ respond(Req, State, StatusCode) ->
   {ok, Req2} = cowboy_req:reply(StatusCode, Req),
   terminate(Req2, State).
 
-terminate(Req, State = #state{env = Env, conn = Conn, backend = Conn}) ->
+terminate(Req, State = #state{env = Env, keep_alive = true}) ->
   proxy_terminate(Req, State),
   {ok, Req, [{result, ok}|Env]};
 terminate(Req, State = #state{env = Env, conn = Conn}) ->
