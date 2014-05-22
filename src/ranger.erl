@@ -20,7 +20,8 @@
 
   res_status :: integer(),
   res_headers = [] :: [{iolist(), iolist()}],
-  res_has_body :: boolean()
+  res_has_body :: boolean(),
+  res_chunked :: boolean()
 }).
 
 -define(HANDLE_ERROR(State),
@@ -231,9 +232,11 @@ chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
 res_status(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout, res_headers = ResHeaders}) ->
   case gun:await(Conn, Ref, Timeout) of
     {response, Fin, Status, Headers} ->
+      Chunked = fast_key:get(<<"transfer-encoding">>, Headers) =:= <<"chunked">>,
       next(Req, State#state{res_status = Status,
                             res_headers = filter_headers(Headers, ResHeaders),
-                            res_has_body = Fin =:= nofin}, fun res_headers/2);
+                            res_has_body = Fin =:= nofin,
+                            res_chunked = Chunked}, fun res_headers/2);
     {error, timeout} ->
       next(Req, State, 504);
     {error, Reason} ->
@@ -250,26 +253,33 @@ res_headers(Req, State = #state{res_headers = ResHeaders}) ->
                              res_headers = FilteredHeaders}, fun reply/2)
   end.
 
-reply(Req, State = #state{res_status = Status, res_headers = Headers, res_has_body = true}) ->
-  {ok, Req2} = cowboy_req:chunked_reply(Status, Headers, Req),
-  next(Req2, State, fun res_body/2);
+reply(Req, State = #state{res_has_body = true}) ->
+  next(Req, State, fun res_body/2);
 reply(Req, State = #state{res_status = Status, res_headers = Headers}) ->
   {ok, Req2} = cowboy_req:reply(Status, Headers, Req),
   terminate(Req2, State).
 
-res_body(Req, State) ->
+res_body(Req, State = #state{res_status = Status, res_headers = Headers, res_chunked = true}) ->
   case exported(Req, State, res_body, 3) of
     true ->
-      next(Req, State, fun transform_res_body/2);
+      next(Req, State#state{res_chunked = false}, fun transform_res_body/2);
     _ ->
-      next(Req, State, fun chunk_res_body/2)
-  end.
+      {ok, Req2} = cowboy_req:chunked_reply(Status, Headers, Req),
+      next(Req2, State, fun chunk_res_body/2)
+  end;
+res_body(Req, State) ->
+  next(Req, State, fun transform_res_body/2).
 
 transform_res_body(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout}) ->
   case gun:await_body(Conn, Ref, Timeout) of
     {ok, Body} ->
-      {Body2, Req2, HandlerState} = call(Req, State, res_body, Body),
-      send(Req2, State#state{handler_state = HandlerState}, Body2, fun terminate/2);
+      case call(Req, State, res_body, Body) of
+        no_call ->
+          send(Req, State, Body, fun terminate/2);
+        ?HANDLE_ERROR(State);
+        {Body2, Req2, HandlerState} ->
+          send(Req2, State#state{handler_state = HandlerState}, Body2, fun terminate/2)
+      end;
     {error, timeout} ->
       next(Req, State, 504);
     {error, Reason} ->
@@ -387,6 +397,8 @@ filter_headers([{<<"content-length">>, _}|Headers], Acc) ->
   filter_headers(Headers, Acc);
 filter_headers([{<<"date">>, _}|Headers], Acc) ->
   filter_headers(Headers, Acc);
+filter_headers([{<<"transfer-encoding">>, _}|Headers], Acc) ->
+  filter_headers(Headers, Acc);
 filter_headers([Header|Headers], Acc) ->
   filter_headers(Headers, [Header|Acc]).
 
@@ -441,7 +453,7 @@ call(Req, State = #state{handler = Handler, handler_state = HandlerState}, Callb
       no_call
   end.
 
-send(Req, State, Data, Next) ->
+send(Req, State = #state{res_chunked = true}, Data, Next) ->
   case cowboy_req:chunk(Data, Req) of
     ok ->
       next(Req, State, Next);
@@ -449,7 +461,10 @@ send(Req, State, Data, Next) ->
       terminate(Req, State);
     {error, Reason} ->
       error_terminate(Req, State, error, Reason, send, 4)
-  end.
+  end;
+send(Req, State = #state{res_status = Status, res_headers = Headers}, Data, Next) ->
+  {ok, Req2} = cowboy_req:reply(Status, Headers, Data, Req),
+  next(Req2, State, Next).
 
 exported(_Req, _State = #state{handler = Handler}, Callback, Arity) ->
   erlang:function_exported(Handler, Callback, Arity).
