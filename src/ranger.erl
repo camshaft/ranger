@@ -336,10 +336,16 @@ format_forwarded_host(Req, Header) ->
 format_forwarded_port(Req, Header) ->
   case cowboy_req:header(Header, Req) of
     {undefined, _} ->
-      [Port] = cowboy_req:get([port], Req),
+      Port = get_port(Req),
       [{Header, integer_to_binary(Port)}];
     _ ->
       []
+  end.
+
+get_port(Req) ->
+  case cowboy_req:get([port], Req) of
+    [undefined] -> 443;
+    [Port] -> Port
   end.
 
 format_forwarded_path(Req, Header) ->
@@ -481,11 +487,14 @@ respond(Req, State, StatusCode) ->
 
 terminate(Req, State = #state{env = Env, keep_alive = true}) ->
   proxy_terminate(Req, State),
-  {ok, Req, [{result, ok}|Env]};
-terminate(Req, State = #state{env = Env, conn = Conn}) ->
+  {ok, Req, Env};
+terminate(Req, State = #state{env = Env, conn = Conn}) when is_pid(Conn) ->
   proxy_terminate(Req, State),
   ok = gun:shutdown(Conn),
-  {ok, Req, [{result, ok}|Env]}.
+  {ok, Req, Env};
+terminate(Req, State = #state{env = Env}) ->
+  proxy_terminate(Req, State),
+  {ok, Req, Env}.
 
 error_terminate(Req, State, Class, Reason, Callback, Arity) ->
   error_terminate(Req, State, Class, Reason, Callback, Arity, 500).
