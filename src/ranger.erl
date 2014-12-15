@@ -234,6 +234,9 @@ res_status(Req, State = #state{conn = Conn, ref = Ref, timeout = Timeout, res_he
                             res_chunked = Chunked}, fun res_headers/2);
     {error, timeout} ->
       next(Req, State, 504);
+    {error, {closed, _}} ->
+      %% TODO report this
+      terminate(Req, State);
     {error, Reason} ->
       error_terminate(Req, State, error, Reason, res_status, 2, 502)
   end.
