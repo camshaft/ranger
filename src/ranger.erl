@@ -199,7 +199,7 @@ req_body(Req, State) ->
     true ->
       next(Req, State, fun transform_req_body/2);
     _ ->
-      next(Req, State, fun chunk_req_body/2)
+      next(Req, State, fun send_req_body/2)
   end.
 
 transform_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
@@ -209,20 +209,14 @@ transform_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
       {Body2, Req3, HandlerState} = call(Req2, State, req_body, Body),
       ok = gun:data(Conn, Ref, fin, Body2),
       next(Req3, State#state{handler_state = HandlerState}, fun res_status/2);
-    {error, chunked} ->
-      %% TODO buffer this and call `req_body/3`
-      next(Req, State, fun chunk_req_body/2);
     {error, badlength} ->
       next(Req, State, 413)
   end.
 
-chunk_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
-  case cowboy_req:stream_body(Req) of
+send_req_body(Req, State = #state{conn = Conn, ref = Ref}) ->
+  case cowboy_req:body(Req) of
     {ok, Body, Req2} ->
-      ok = gun:data(Conn, Ref, nofin, Body),
-      chunk_req_body(Req2, State);
-    {done, Req2} ->
-      ok = gun:data(Conn, Ref, fin, <<>>),
+      ok = gun:data(Conn, Ref, fin, Body),
       next(Req2, State, fun res_status/2);
     {error, Reason} ->
       error_terminate(Req, State, error, Reason, chunk_req_body, 2, 400)
